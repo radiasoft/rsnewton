@@ -1,0 +1,37 @@
+[build-system]
+requires = [
+    "setuptools>=66",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+authors = [
+    { name = "RadiaSoft LLC", email = "pip@radiasoft.net" },
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Natural Language :: English",
+    "Programming Language :: Python",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "pykern",
+    "h5py",
+    "numpy",
+]
+description = "Utilities for OPAL/TRACK proton linac studies"
+name = "rsnewton"
+readme = "README.md"
+version = "0.0.1"
+
+[project.scripts]
+rsnewton = "rsnewton.rsnewton_console:main"
+
+[project.urls]
+Homepage = "https://git.radiasoft.org/rsnewton"
+
+[tool.setuptools.packages.find]
+include = ["rsnewton*"]
