@@ -5,54 +5,157 @@ import pybobyqa
 import numpy as np
 import math
 import csv
+import pandas as pd
 
-# --- 1. Core Functions ---
 
-def extract_penalty(stat_file, loss_weight=2000.0, emit_weight=1.0):
-    """Calculates the penalty from a .stat file (Lower is better)."""
-    if not os.path.exists(stat_file): return 1e6
-    with open(stat_file, 'r') as file: lines = file.readlines()
+# Global cache so we only read the nominal file from disk once
+_NOMINAL_CACHE = None
 
-    col_names = []
-    in_column = False
-    for line in lines:
-        line_stripped = line.strip()
-        if line_stripped.startswith('&column'): in_column = True
-        elif in_column and line_stripped.startswith('name='): col_names.append(line_stripped.split('=')[1].strip(',"\'').lower())
-        elif line_stripped.startswith('&end') and in_column: in_column = False
+def extract_penalty(stat_file_path):
+    global _NOMINAL_CACHE
 
-    try:
-        idx_s = col_names.index('s')
-        idx_particles = col_names.index('numparticles')
-        idx_eps_x = col_names.index('rms_x')
-        idx_eps_y = col_names.index('rms_y')
-        idx_eps_z = col_names.index('rms_s')
-    except ValueError: return 1e6
+    # --- CONFIGURATION WEIGHTS ---
+    loss_weight = 100.0
+    emit_weight = 50.0
+    energy_weight = 100.0
+    # -----------------------------
 
-    data_rows = [ [float(x) for x in line.split()] for line in lines if len(line.split()) == len(col_names) ]
-    if not data_rows: return 1e6
+    # 1. Load the trial data using the parser
+    df_trial = read_opal_stat(stat_file_path)
 
-    initial_particles = data_rows[0][idx_particles]
-    final_row = data_rows[-1]
-    final_s = final_row[idx_s]
+    # 2. Load and cache the nominal baseline (if not already loaded)
+    if _NOMINAL_CACHE is None:
+        df_nom = read_opal_stat("nominal.stat")
+        nom_last = df_nom.iloc[-1]
+        
+        _NOMINAL_CACHE = {
+            'emit_x': nom_last['emit_x'],
+            'emit_y': nom_last['emit_y'],
+            'emit_s': nom_last['emit_s'],
+            'energy': nom_last['energy']
+        }
 
-    target_s = 148.0
-    if final_s < target_s:
-        return 1e5 + ((target_s - final_s) * loss_weight)
+    nom = _NOMINAL_CACHE
 
-    transmission = final_row[idx_particles] / initial_particles
+    # 3. Extract current trial's starting and ending states
+    initial_particles = df_trial.iloc[0]['numParticles']
+    last_row = df_trial.iloc[-1]
+    final_particles = last_row['numParticles']
+
+    transmission = final_particles / initial_particles if initial_particles > 0 else 0.0
+
+    # Instant failure constraint: if beam dies, return max penalty immediately
+    if transmission < 0.05:
+        return 1e6
+    # Did it reach the end? ---
+    # Using 147.5m to allow for discrete OPAL integration step boundaries
+    if last_row['s'] < 147.5:
+        return 1e6
+        
+
+    eps_x = last_row['emit_x']
+    eps_y = last_row['emit_y']
+    eps_z = last_row['emit_s']
+    final_energy = last_row['energy']
+
+    # 4. Calculate Penalties
+
+    # Loss Penalty (Exponential wall)
     loss_fraction = 1.0 - transmission
-
-    eps_x = final_row[idx_eps_x] * 1e6
-    eps_y = final_row[idx_eps_y] * 1e6
-    eps_z = final_row[idx_eps_z] * 1e6
-
     loss_penalty = loss_weight * (math.exp(loss_fraction * 10) - 1.0)
-    emit_penalty = emit_weight * ((eps_x + eps_y + eps_z * 2.0) / max(transmission, 0.01))
 
-    return loss_penalty + emit_penalty
+    # Emittance Penalty (Normalized relative percentage growth)
+    # max(0, ...) prevents PyBOBYQA from being rewarded for shrinking the beam below nominal
+    dx = max(0, (eps_x - nom['emit_x']) / nom['emit_x'])
+    dy = max(0, (eps_y - nom['emit_y']) / nom['emit_y'])
+    dz = max(0, (eps_z - nom['emit_s']) / nom['emit_s'])
 
+    #emit_penalty = emit_weight * (dx + dy + dz * 2.0)
+    # The squared formulation (L2 norm-style) heavily punishes severe blowups
+    # in a single plane, forcing the optimizer to balance X and Y distortion.
+    emit_penalty = emit_weight * (dx**2 + dy**2 + (dz * 2.0)**2)
 
+    # Energy Penalty (Percentage difference from target energy)
+    energy_error_fraction = abs(final_energy - nom['energy']) / nom['energy']
+    energy_penalty = energy_weight * energy_error_fraction
+
+    return loss_penalty + emit_penalty + energy_penalty
+
+import pandas as pd
+
+def read_opal_stat(filepath):
+    """
+    SDDS-compliant OPAL .stat file parser.
+    Reads SDDS &column blocks to extract headers dynamically,
+    then parses the ASCII data block.
+    """
+    with open(filepath, 'r') as f:
+        lines = f.readlines()
+        
+    headers = []
+    data_start_idx = -1
+    
+    in_column_block = False
+    in_data_block = False
+    
+    for i, line in enumerate(lines):
+        clean_line = line.strip()
+        
+        # 1. Look for column definitions
+        if clean_line.startswith('&column'):
+            in_column_block = True
+            continue
+            
+        if in_column_block:
+            # Extract the variable name (e.g., 'name=s,' -> 's')
+            if clean_line.startswith('name='):
+                col_name = clean_line.split('=')[1]
+                # Strip out commas, quotes, and whitespace
+                col_name = col_name.strip(',"\' ')
+                headers.append(col_name)
+            elif clean_line == '&end':
+                in_column_block = False
+            continue
+            
+        # 2. Look for the start of the actual data
+        if clean_line.startswith('&data'):
+            in_data_block = True
+            continue
+            
+        # The data block ends with '&end'. 
+        # Everything after this specific '&end' is the numerical text.
+        if in_data_block and clean_line == '&end':
+            data_start_idx = i + 1
+            break
+
+    if not headers or data_start_idx == -1:
+        raise ValueError(f"Could not parse SDDS headers or data in {filepath}")
+
+    num_cols = len(headers)
+    valid_data = []
+    
+    # 3. Read the numerical data safely
+    for line in lines[data_start_idx:]:
+        clean_line = line.strip()
+        if not clean_line:
+            continue
+            
+        parts = clean_line.split()
+        
+        # Enforce column geometry to skip any mid-file garbage
+        if len(parts) == num_cols:
+            try:
+                float(parts[0])
+                valid_data.append(parts)
+            except ValueError:
+                pass
+
+    # Build DataFrame
+    df = pd.DataFrame(valid_data, columns=headers)
+    df = df.apply(pd.to_numeric, errors='coerce')
+    
+    return df
+    
 def discover_cavities(template_file):
     """Extracts an ordered list of all cavity names from the template."""
     cavities = []
@@ -121,13 +224,13 @@ def generate_run_file(template_file, output_file, broken_cavity, psdumpfreq, rf_
 
 # --- 2. Main Execution ---
 
-def main(broken_cavity, host_id):
-    template_file = "template.i"
+def main(broken_cavity, host_id, template_file):
+    # Remove the hardcoded template_file = "template.in" from here
 
     # --- CONFIGURATION ---
     N_ADJACENT = 5            # Number of cavities to tune BEFORE and AFTER
-    VOLT_BOUND_PCT = 0.2     # Allow +/- 15% change in voltage
-    LAG_BOUND_ABS = 0.1       # Allow +/- 0.1 radian shift in phase
+    VOLT_BOUND_PCT = 0.2     # Allow +/- 20% change in voltage
+    LAG_BOUND_ABS =  0.4 # 0.1       # Allow +/- 0.1 radian shift in phase
     # ---------------------
 
     all_cavities = discover_cavities(template_file)
@@ -171,12 +274,19 @@ def main(broken_cavity, host_id):
     bounds = (np.array(lower_bounds_list), np.array(upper_bounds_list))
 
     # --- PHASE 1: Baseline Run ---
-    print("\n[Phase 1] Evaluating unoptimized failure (psdumpfreq=100)...")
-    init_file = f"initial_{broken_cavity}.i"
-    init_stat = f"initial_{broken_cavity}.stat"
-    generate_run_file(template_file, init_file, broken_cavity, 100)
-    run_opal(init_file, host_id=host_id)
-    print(f"Initial Penalty: {extract_penalty(init_stat):.2f}")
+
+    initial_h5 = f"initial_{broken_cavity}.h5"
+    initial_stat = f"initial_{broken_cavity}.stat"
+
+    if os.path.exists(initial_h5):
+        print(f"  -> [Skip] {initial_h5} already exists. Skipping baseline tracking.")
+    else:
+        print("\n[Phase 1] Evaluating unoptimized failure (psdumpfreq=100)...")
+        init_file = f"initial_{broken_cavity}.i"
+        init_stat = f"initial_{broken_cavity}.stat"
+        generate_run_file(template_file, init_file, broken_cavity, 100)
+        run_opal(init_file, host_id=host_id)
+        print(f"Initial Penalty: {extract_penalty(init_stat):.2f}")
 
 
     # --- PHASE 2: PyBOBYQA Optimization ---
@@ -253,10 +363,13 @@ def main(broken_cavity, host_id):
     print(f"  initial_{broken_cavity}.h5")
     print(f"  optimal_{broken_cavity}.h5")
 
+
+
 if __name__ == "__main__":
     import sys
-    # Accept arguments from the command line, defaulting to CAV050 and host 1 if none provided
+    # Accept arguments: python optimize_rf_recovery.py CAV050 1 checkpoint_CAV040/template.in
     cav = sys.argv[1] if len(sys.argv) > 1 else "CAV050"
     host = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+    template = sys.argv[3] if len(sys.argv) > 3 else "template.in"
 
-    main(cav, host)
+    main(cav, host, template)
